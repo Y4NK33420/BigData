@@ -1,0 +1,55 @@
+version: '3.8'
+
+# ============================================================
+#  Social Media Analytics Dashboard
+#  Services: spark (FastAPI + PySpark) + frontend (React + nginx)
+#  Shared volume: ./data mounted at /app/data in spark container
+# ============================================================
+
+services:
+
+  # ── Spark / FastAPI Backend ───────────────────────────────
+  spark:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    container_name: spark_analytics
+    env_file: .env
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./data:/app/data          # Medallion data (Bronze/Silver/Gold)
+      - ./ingest.py:/app/ingest.py
+      - ./process.py:/app/process.py
+      - ./api.py:/app/api.py
+      - ./reddit_scrap.py:/app/reddit_scrap.py
+    ports:
+      - "5000:5000"               # FastAPI REST API (direct access for dev)
+    networks:
+      - analytics_net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 25s
+
+  # ── React Frontend (nginx) ────────────────────────────────
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: react_dashboard
+    ports:
+      - "3000:80"                 # React app on port 3000
+    networks:
+      - analytics_net
+    depends_on:
+      spark:
+        condition: service_healthy
+    restart: unless-stopped
+
+networks:
+  analytics_net:
+    driver: bridge
