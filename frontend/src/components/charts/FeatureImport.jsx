@@ -5,9 +5,9 @@ const LABEL_MAP = { like_count: 'Like Count', comment_count: 'Comment Count', se
 const Tip = ({ active, payload }) => {
   if (!active || !payload?.length) return null
   return (
-    <div style={{ background: '#16162a', border: '1px solid rgba(255,255,255,0.07)', borderRadius: 8, padding: '8px 14px', fontSize: '0.82rem' }}>
+    <div style={{ background: '#1a1a1a', border: '1px solid #383838', borderRadius: 8, padding: '8px 14px', fontSize: '0.82rem' }}>
       <div>{LABEL_MAP[payload[0].payload.feature] || payload[0].payload.feature}</div>
-      <div style={{ color: '#a78bfa' }}>Importance: <strong>{Number(payload[0].value).toFixed(4)}</strong></div>
+      <div style={{ color: '#FF4500' }}>Importance: <strong>{Number(payload[0].value).toFixed(4)}</strong></div>
     </div>
   )
 }
@@ -25,13 +25,13 @@ export default function FeatureImport({ data }) {
         <XAxis type="number" tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 10 }} axisLine={false} tickLine={false} domain={[0, 1]} />
         <YAxis type="category" dataKey="label" tick={{ fill: 'rgba(255,255,255,0.6)', fontSize: 11 }} axisLine={false} tickLine={false} width={110} />
         <Tooltip content={<Tip />} />
-        <Bar dataKey="importance" radius={[0,4,4,0]}>
+        <Bar dataKey="importance" radius={[0, 4, 4, 0]}>
           <LabelList dataKey="importance" position="right" formatter={v => v.toFixed(3)} style={{ fill: 'rgba(255,255,255,0.5)', fontSize: '0.75rem' }} />
           {sorted.map((d, i) => {
             const t = i / (sorted.length - 1 || 1)
-            const r = Math.round(79 + t * (232 - 79))
-            const g = Math.round(70 + t * (121 - 70))
-            const b = Math.round(229 + t * (249 - 229))
+            const r = 255
+            const g = Math.round(69 - t * 69)
+            const b = 0
             return <Cell key={i} fill={`rgb(${r},${g},${b})`} fillOpacity={0.8} />
           })}
         </Bar>

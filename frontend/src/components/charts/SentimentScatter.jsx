@@ -4,8 +4,8 @@ const Tip = ({ active, payload }) => {
   if (!active || !payload?.length) return null
   const d = payload[0].payload
   return (
-    <div style={{ background: '#16162a', border: '1px solid rgba(255,255,255,0.07)', borderRadius: 8, padding: '8px 14px', fontSize: '0.82rem', maxWidth: 220 }}>
-      <div style={{ fontWeight: 600, marginBottom: 4, wordBreak: 'break-word' }}>{d.title?.slice(0,60)}…</div>
+    <div style={{ background: '#1a1a1a', border: '1px solid #383838', borderRadius: 8, padding: '8px 14px', fontSize: '0.82rem', maxWidth: 220 }}>
+      <div style={{ fontWeight: 600, marginBottom: 4, wordBreak: 'break-word' }}>{d.title?.slice(0, 60)}…</div>
       <div>Sentiment: <strong>{d.sentiment_score?.toFixed(3)}</strong></div>
       <div>Views: <strong>{Number(d.view_count).toLocaleString()}</strong></div>
       <div>Likes: <strong>{Number(d.like_count).toLocaleString()}</strong></div>
@@ -20,7 +20,7 @@ export default function SentimentScatter({ data }) {
   const maxLikes = Math.max(...df.map(r => r.like_count || 0), 1)
 
   const getColor = s => {
-    if (s >  0.05) return '#22c55e'
+    if (s > 0.05) return '#22c55e'
     if (s < -0.05) return '#ef4444'
     return '#fbbf24'
   }
@@ -37,7 +37,7 @@ export default function SentimentScatter({ data }) {
         <YAxis
           type="number" dataKey="view_count" name="Views"
           tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 10 }} axisLine={false} tickLine={false}
-          tickFormatter={v => v >= 1e6 ? `${(v/1e6).toFixed(1)}M` : v >= 1e3 ? `${(v/1e3).toFixed(0)}K` : v}
+          tickFormatter={v => v >= 1e6 ? `${(v / 1e6).toFixed(1)}M` : v >= 1e3 ? `${(v / 1e3).toFixed(0)}K` : v}
         />
         <Tooltip content={<Tip />} />
         <Scatter

@@ -12,17 +12,16 @@ services:
   spark:
     build:
       context: .
-      dockerfile: Dockerfile.spark
+      dockerfile: docker/Dockerfile.spark
     container_name: spark_analytics
     env_file: .env
     environment:
       - PYTHONUNBUFFERED=1
     volumes:
       - ./data:/app/data          # Medallion data (Bronze/Silver/Gold)
-      - ./ingest.py:/app/ingest.py
-      - ./process.py:/app/process.py
-      - ./api.py:/app/api.py
-      - ./reddit_scrap.py:/app/reddit_scrap.py
+      - ./data_pipeline:/app/data_pipeline
+      - ./backend_api:/app/backend_api
+      - /mnt/c/Users/asus/Downloads/youtube_data:/mnt/youtube_static:ro  # Static YT dataset
     ports:
       - "5000:5000"               # FastAPI REST API (direct access for dev)
     networks:
@@ -39,7 +38,7 @@ services:
   frontend:
     build:
       context: .
-      dockerfile: Dockerfile.frontend
+      dockerfile: docker/Dockerfile.frontend
     container_name: react_dashboard
     ports:
       - "3000:80"                 # React app on port 3000
