@@ -1,0 +1,1 @@
+to run the this project add your env file, and change the image in dockerfile.spark to any of your image which has spark 

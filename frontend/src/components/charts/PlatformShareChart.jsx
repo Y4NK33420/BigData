@@ -46,7 +46,8 @@ export default function PlatformShareChart({ ytTimeline, rdTimeline }) {
           </Pie>
           <Tooltip
             allowEscapeViewBox={{ x: true, y: true }}
-            contentStyle={{ background: 'var(--card)', border: '1px solid var(--border)', borderRadius: 14, color: 'var(--text)' }}
+            contentStyle={{ background: 'var(--card)', border: '1px solid var(--border)', borderRadius: 14, color: '#fff' }}
+            itemStyle={{ color: '#fff' }}
             formatter={value => value.toLocaleString()}
           />
         </PieChart>
