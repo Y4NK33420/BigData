@@ -19,6 +19,7 @@ import sys
 import re
 import json
 from datetime import datetime
+from pathlib import Path
 
 keyword  = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else "technology"
 kw_safe  = keyword.replace(" ", "_").lower()
@@ -336,6 +337,10 @@ print("[Gold] ✅ All 6 analytical tables saved!")
 print("[Predictive] Training Random Forest …")
 
 FEATURE_COLS = ["like_count", "comment_count", "sentiment_score", "engagement_rate"]
+GLOBAL_TRAINING_PATH = f"{GOLD_PATH}/global_training_rows"
+GLOBAL_MODEL_PATH = f"{GOLD_PATH}/rf_model_global"
+GLOBAL_MARKERS_PATH = f"{GLOBAL_TRAINING_PATH}/_markers"
+KEYWORD_MODEL_WEIGHT = 5
 
 feature_df = (
     yt_silver
@@ -352,11 +357,82 @@ n_rows = feature_df.count()
 print(f"[Predictive] Training samples: {n_rows}")
 
 if n_rows >= 5:
+    os.makedirs(GLOBAL_TRAINING_PATH, exist_ok=True)
+    os.makedirs(GLOBAL_MARKERS_PATH, exist_ok=True)
+    existing_global_df = None
+    try:
+        if os.path.isdir(GLOBAL_TRAINING_PATH):
+            global_dirs = [
+                str(p) for p in Path(GLOBAL_TRAINING_PATH).iterdir()
+                if p.is_dir() and p.name != "_markers"
+            ]
+        else:
+            global_dirs = []
+        if global_dirs:
+            existing_global_df = (
+                spark.read
+                .parquet(*global_dirs)
+                .select("view_count", *FEATURE_COLS)
+                .dropna()
+            )
+            global_rows = existing_global_df.count()
+            print(f"[Predictive] Global pretrain rows available: {global_rows}")
+            if global_rows == 0:
+                existing_global_df = None
+    except Exception as global_read_err:
+        print(f"[Predictive] Global training store unavailable: {global_read_err}")
+        existing_global_df = None
+
+    current_run_path = f"{GLOBAL_TRAINING_PATH}/{kw_safe}__{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+    (
+        feature_df
+        .withColumn("source_keyword", lit(kw_safe))
+        .write.mode("overwrite")
+        .parquet(current_run_path)
+    )
+    Path(f"{GLOBAL_MARKERS_PATH}/{kw_safe}.done").touch()
+
+    if existing_global_df is not None:
+        global_plus_current = existing_global_df.unionByName(feature_df)
+    else:
+        global_plus_current = feature_df
+
+    global_total_rows = global_plus_current.count()
+    if global_total_rows >= 5:
+        global_assembled = VectorAssembler(
+            inputCols=FEATURE_COLS, outputCol="features"
+        ).transform(global_plus_current)
+        global_model = RandomForestRegressor(
+            featuresCol="features",
+            labelCol="view_count",
+            numTrees=80,
+            maxDepth=6,
+            seed=42,
+        ).fit(global_assembled)
+        global_model.write().overwrite().save(GLOBAL_MODEL_PATH)
+        print(f"[Predictive] Global RF baseline saved -> {GLOBAL_MODEL_PATH} ({global_total_rows} rows)")
+
+    adapted_training_df = feature_df
+    if existing_global_df is not None:
+        weighted_keyword_df = feature_df
+        for _ in range(KEYWORD_MODEL_WEIGHT - 1):
+            weighted_keyword_df = weighted_keyword_df.unionByName(feature_df)
+        adapted_training_df = existing_global_df.unionByName(weighted_keyword_df)
+        print(
+            "[Predictive] Fine-tuning via weighted retraining: "
+            f"global rows + {KEYWORD_MODEL_WEIGHT}x current keyword rows"
+        )
+
     assembled = VectorAssembler(
+        inputCols=FEATURE_COLS, outputCol="features"
+    ).transform(adapted_training_df)
+
+    eval_assembled = VectorAssembler(
         inputCols=FEATURE_COLS, outputCol="features"
     ).transform(feature_df)
 
-    if n_rows >= 10:
+    adapted_rows = adapted_training_df.count()
+    if adapted_rows >= 10:
         train, test = assembled.randomSplit([0.8, 0.2], seed=42)
     else:
         train = test = assembled   # use all when data is sparse
@@ -369,7 +445,10 @@ if n_rows >= 5:
         seed=42,
     ).fit(train)
 
-    predictions = rf_model.transform(test)
+    model_path = f"{GOLD_PATH}/rf_model_{kw_safe}"
+    rf_model.write().overwrite().save(model_path)
+
+    predictions = rf_model.transform(eval_assembled)
 
     rmse = RegressionEvaluator(
         labelCol="view_count", predictionCol="prediction", metricName="rmse"
@@ -404,10 +483,14 @@ if n_rows >= 5:
         "keyword":          keyword,
         "rmse":             rmse,
         "r2":               r2,
-        "training_samples": n_rows,
+        "training_samples": adapted_rows,
+        "keyword_samples":  n_rows,
+        "global_samples":   max(global_total_rows - n_rows, 0),
+        "model_strategy":   "global_pretrain_plus_keyword_weighted_retraining",
         "timestamp":        datetime.utcnow().isoformat(),
     }]).to_parquet(f"{GOLD_PATH}/model_metrics_{kw_safe}.parquet")
 
+    print(f"[Predictive] RF model saved -> {model_path}")
     print("[Predictive] ✅ Predictions & feature importance saved!")
 else:
     print(f"[Predictive] ⚠️  Only {n_rows} samples — need ≥5. Skipping RF.")
