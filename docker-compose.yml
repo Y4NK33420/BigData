@@ -21,7 +21,7 @@ services:
       - ./data:/app/data          # Medallion data (Bronze/Silver/Gold)
       - ./data_pipeline:/app/data_pipeline
       - ./backend_api:/app/backend_api
-      - /mnt/c/Users/asus/Downloads/youtube_data:/mnt/youtube_static:ro  # Static YT dataset
+      - ./.env:/app/.env:ro
     ports:
       - "5000:5000"               # FastAPI REST API (direct access for dev)
     networks:

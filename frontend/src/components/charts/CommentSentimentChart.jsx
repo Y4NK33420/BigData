@@ -20,8 +20,9 @@ export default function CommentSentimentChart({ topVideos }) {
                 <YAxis type="category" dataKey="name" stroke="var(--border)" tick={{ fill: 'var(--text-muted)' }} fontSize={10} width={160} />
                 <Tooltip
                     formatter={(v, name) => [v.toFixed(3), name === 'comment_sentiment' ? 'Comment Sentiment' : 'Title Sentiment']}
-                    contentStyle={{ background: 'var(--card)', border: '1px solid var(--border)', borderRadius: 8 }}
-                    labelStyle={{ color: 'var(--text)' }}
+                    contentStyle={{ background: 'var(--card)', border: '1px solid var(--border)', borderRadius: 8, color: '#fff' }}
+                    labelStyle={{ color: '#fff' }}
+                    itemStyle={{ color: '#fff' }}
                 />
                 <Bar dataKey="comment_sentiment" radius={[0, 4, 4, 0]}>
                     {data.map((entry, i) => <Cell key={i} fill={getColor(entry.comment_sentiment)} />)}

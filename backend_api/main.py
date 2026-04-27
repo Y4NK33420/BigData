@@ -16,6 +16,8 @@ import sys
 import glob
 import uuid
 import time
+import json
+import re
 import logging
 import threading
 import subprocess
@@ -27,6 +29,29 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+
+def load_env_from_dotenv(dotenv_path=None):
+    if dotenv_path is None:
+        dotenv_path = Path(__file__).resolve().parent.parent / ".env"
+    dotenv_path = Path(dotenv_path)
+    if not dotenv_path.exists():
+        return
+
+    for line in dotenv_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key:
+            os.environ[key] = value
+
+
+def get_gemini_api_key() -> str:
+    load_env_from_dotenv()
+    return os.environ.get("GEMINI_API_KEY", "").strip()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Setup
@@ -41,7 +66,6 @@ log = logging.getLogger(__name__)
 GOLD_PATH   = "/app/data/gold"
 SCRIPTS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data_pipeline")
 PYTHON      = sys.executable
-GEMINI_KEY  = os.environ.get("GEMINI_API_KEY", "")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # In-Memory Job Store (thread-safe)
@@ -320,14 +344,147 @@ def list_keywords():
     return {"keywords": sorted(seen)}
 
 
+def _avg(rows: list[dict], key: str, default: float = 0.0) -> float:
+    vals = [float(r.get(key) or 0) for r in rows if r.get(key) is not None]
+    return sum(vals) / len(vals) if vals else default
+
+
+def _extract_json_array(text: str) -> list[dict]:
+    """Parse Gemini JSON, tolerating fenced output or brief surrounding prose."""
+    cleaned = text.strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError:
+        match = re.search(r"\[[\s\S]*\]", cleaned)
+        if not match:
+            return []
+        parsed = json.loads(match.group(0))
+    if isinstance(parsed, dict):
+        parsed = parsed.get("ideas", [])
+    return parsed if isinstance(parsed, list) else []
+
+
+def _fallback_ideas(keyword: str, content_gaps: list[dict], top_videos: list[dict]) -> list[dict]:
+    gaps = content_gaps[:3]
+    if not gaps:
+        gaps = [{"gap_phrase": keyword, "opportunity_score": 1}] * 3
+    ideas = []
+    for idx, gap in enumerate(gaps, start=1):
+        phrase = gap.get("gap_phrase") or keyword
+        ideas.append({
+            "title": f"{phrase.title()}: What People Are Missing",
+            "format": "Explainer with data-backed examples" if idx == 1 else "Comparison breakdown" if idx == 2 else "Practical tutorial",
+            "target_audience": f"Viewers researching {keyword}",
+            "rationale": f"Reddit demand signal found for '{phrase}', with limited matching YouTube coverage.",
+        })
+    return ideas
+
+
+def _predict_video_ideas(keyword: str, ideas: list[dict], top_videos: list[dict]) -> list[dict]:
+    """
+    Score generated ideas with the persisted Spark Random Forest model.
+    The model was trained on: like_count, comment_count, sentiment_score, engagement_rate.
+    For an unmade idea, we estimate those pre-publish signals from topic averages plus
+    the idea title/rationale sentiment, then let the RF model predict view_count.
+    """
+    kw = kw_safe(keyword)
+    model_path = f"{GOLD_PATH}/rf_model_{kw}"
+    if not ideas or not os.path.isdir(model_path):
+        global_model_path = f"{GOLD_PATH}/rf_model_global"
+        if not ideas or not os.path.isdir(global_model_path):
+            return ideas
+        model_path = global_model_path
+        model_label = "global pretrained Spark Random Forest model"
+    else:
+        model_label = "keyword-adapted Spark Random Forest model"
+
+    try:
+        from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+        from pyspark.sql import SparkSession
+        from pyspark.ml.feature import VectorAssembler
+        from pyspark.ml.regression import RandomForestRegressionModel
+
+        sia = SentimentIntensityAnalyzer()
+        base_like = _avg(top_videos, "like_count", 100.0)
+        base_comments = _avg(top_videos, "comment_count", 10.0)
+        base_engagement = _avg(top_videos, "engagement_rate", 1.0)
+        avg_views = _avg(top_videos, "view_count", 0.0)
+
+        feature_rows = []
+        enriched = []
+        for idx, idea in enumerate(ideas[:3], start=1):
+            text = " ".join(str(idea.get(k, "")) for k in ("title", "format", "target_audience", "rationale"))
+            sentiment = float(sia.polarity_scores(text)["compound"])
+            sentiment_boost = 1 + max(sentiment, 0) * 0.25
+            rank_boost = max(1.0, 1.18 - (idx - 1) * 0.08)
+            est_like = max(base_like * sentiment_boost * rank_boost, 1.0)
+            est_comments = max(base_comments * (1 + abs(sentiment) * 0.15) * rank_boost, 1.0)
+            est_engagement = max(base_engagement * sentiment_boost, 0.01)
+
+            enriched.append({
+                **idea,
+                "idea_rank": idx,
+                "estimated_features": {
+                    "like_count": round(est_like, 2),
+                    "comment_count": round(est_comments, 2),
+                    "sentiment_score": round(sentiment, 4),
+                    "engagement_rate": round(est_engagement, 4),
+                },
+            })
+            feature_rows.append({
+                "idea_rank": idx,
+                "like_count": float(est_like),
+                "comment_count": float(est_comments),
+                "sentiment_score": float(sentiment),
+                "engagement_rate": float(est_engagement),
+            })
+
+        spark = (
+            SparkSession.builder
+            .appName(f"IdeaPrediction_{kw}")
+            .master("local[*]")
+            .config("spark.driver.memory", "1g")
+            .config("spark.sql.shuffle.partitions", "1")
+            .config("spark.ui.showConsoleProgress", "false")
+            .getOrCreate()
+        )
+        spark.sparkContext.setLogLevel("ERROR")
+
+        df = spark.createDataFrame(feature_rows)
+        assembled = VectorAssembler(
+            inputCols=["like_count", "comment_count", "sentiment_score", "engagement_rate"],
+            outputCol="features",
+        ).transform(df)
+        model = RandomForestRegressionModel.load(model_path)
+        scored = model.transform(assembled).select("idea_rank", "prediction").toPandas().to_dict("records")
+        spark.stop()
+
+        by_rank = {int(row["idea_rank"]): max(float(row["prediction"]), 0.0) for row in scored}
+        for idea in enriched:
+            pred = by_rank.get(int(idea["idea_rank"]), 0.0)
+            rmse_floor = max(avg_views * 0.15, pred * 0.2, 1000.0)
+            idea["predicted_views"] = round(pred)
+            idea["predicted_view_range"] = {
+                "low": round(max(pred - rmse_floor, 0)),
+                "high": round(pred + rmse_floor),
+            }
+            idea["prediction_method"] = model_label
+        return enriched
+    except Exception as e:
+        log.warning(f"Idea prediction failed for '{keyword}': {e}")
+        return ideas
+
+
 @app.get("/api/prescribe")
 def prescribe(keyword: str = Query(..., description="Analysis keyword")):
     """
-    Calls Gemini API with the aggregated Gold metrics to generate
-    hyper-specific prescriptive action cards.
-    Requires GEMINI_API_KEY to be set in .env
+    Generate video ideas with Gemini, then score those ideas with the
+    keyword-specific Random Forest model saved by the pipeline.
     """
-    if not GEMINI_KEY:
+    gemini_key = get_gemini_api_key()
+    if not gemini_key:
         raise HTTPException(status_code=503, detail="GEMINI_API_KEY not configured.")
 
     kw = kw_safe(keyword)
@@ -339,11 +496,13 @@ def prescribe(keyword: str = Query(..., description="Analysis keyword")):
     topic_recs    = read_parquet(f"{g}/topic_recommendations_{kw}.parquet")
     model_metrics = read_parquet(f"{g}/model_metrics_{kw}.parquet")
     rd_timeline   = read_parquet(f"{g}/reddit_timeline_{kw}")
+    content_gaps  = read_parquet(f"{g}/content_gaps_{kw}.parquet")
 
     top5_titles   = "\n  - ".join(v.get("title", "") for v in top_videos[:5])
     avg_lv_ratio  = sum(v.get("like_to_view_ratio", 0) for v in top_videos) / max(len(top_videos), 1)
     top3_subs     = ", ".join(s.get("subreddit", "") for s in subreddits[:3])
     top_sub_sizes = ", ".join(f"{s.get('subreddit','')}({int(s.get('post_count',0))} posts)" for s in subreddits[:3])
+    gap_summary   = ", ".join(g.get("gap_phrase", "") for g in content_gaps[:5]) or "no explicit content gaps found"
     rec_summary   = next((r.get("note", "") for r in topic_recs if r.get("metric") == "TOTAL_VIABILITY"), "")
     viability     = next((r.get("raw_score") for r in topic_recs if r.get("metric") == "TOTAL_VIABILITY"), "N/A")
     r2_score      = model_metrics[0].get("r2", "N/A") if model_metrics else "N/A"
@@ -361,21 +520,29 @@ You have access to the following real analytics data — use it precisely in you
 - Average Like/View ratio: {avg_lv_ratio:.4f} ({avg_lv_ratio*100:.2f}%)
 - Top Reddit communities discussing this topic: {top_sub_sizes}
 - Reddit posting activity: {reddit_trend}
+- Content gap phrases from Reddit demand: {gap_summary}
 - Topic Viability Score: {viability}/100
 - Overall viability assessment: {rec_summary}
 - YouTube growth velocity note: {growth_note}
 - Competition saturation note: {sat_note}
+- Random Forest model R2: {r2_score}
 
-Based ONLY on this data, give exactly 3 tightly specific, data-driven recommendations:
-1. **Video Concept**: Suggest a precise video title + format + target audience angle that directly fills a gap visible from the data above.
-2. **Distribution Strategy**: Which exact subreddits to target and what framing works for each community (based on their post counts and sentiment levels).
-3. **Content Risk Warning**: One specific thing to avoid (angle, framing, or claim) based on the saturation and sentiment signals.
+Based ONLY on this data, generate exactly 3 video ideas that can later be scored by a predictive model.
 
-Be concrete. Reference the actual data. No generic advice."""
+Return ONLY valid JSON as an array. Do not wrap it in markdown.
+Each item must have these exact keys:
+- title
+- format
+- target_audience
+- rationale
+- distribution_strategy
+- risk_warning
+
+Make the ideas concrete and title-like. Reference content gaps and subreddit demand when useful."""
 
     try:
         import urllib.request, json as _json
-        url     = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite-preview:generateContent?key={GEMINI_KEY}"
+        url     = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite-preview:generateContent?key={gemini_key}"
         payload = {"contents": [{"parts": [{"text": prompt}]}]}
         req     = urllib.request.Request(
             url, data=_json.dumps(payload).encode(),
@@ -385,14 +552,32 @@ Be concrete. Reference the actual data. No generic advice."""
             result  = _json.loads(resp.read())
             ai_text = result["candidates"][0]["content"]["parts"][0]["text"]
 
+        ideas = _extract_json_array(ai_text)
+        if not ideas:
+            ideas = _fallback_ideas(keyword, content_gaps, top_videos)
+        predicted_ideas = _predict_video_ideas(keyword, ideas, top_videos)
+
+        recommendation_text = "\n\n".join(
+            (
+                f"{i}. {idea.get('title', 'Untitled idea')}\n"
+                f"Format: {idea.get('format', '')}\n"
+                f"Predicted views: {int(idea.get('predicted_views', 0)):,}"
+                if idea.get("predicted_views") is not None else
+                f"{i}. {idea.get('title', 'Untitled idea')}\nFormat: {idea.get('format', '')}"
+            )
+            for i, idea in enumerate(predicted_ideas, start=1)
+        )
+
         return {
             "keyword":         keyword,
             "viability_score": viability,
-            "recommendations": ai_text,
+            "recommendations": recommendation_text,
+            "video_ideas":     predicted_ideas,
             "prompt_context":  {
                 "avg_like_view_ratio": avg_lv_ratio,
                 "top_subreddits":      top3_subs,
                 "assessment":          rec_summary,
+                "model_r2":            r2_score,
             }
         }
     except Exception as e:
