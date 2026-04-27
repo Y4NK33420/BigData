@@ -18,7 +18,6 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-
 def load_env_from_dotenv(dotenv_path=None):
     if dotenv_path is None:
         dotenv_path = Path(__file__).resolve().parent.parent / ".env"
@@ -52,7 +51,21 @@ def get_reddit_user_agent() -> str:
         "BigDataDashboard/1.0 (educational project)",
     )
 
-BRONZE_PATH = "/app/data/bronze"
+def _resolve_data_root() -> Path:
+    """Resolve Medallion data root for both Docker and local development."""
+    env_root = os.environ.get("MEDALLION_DATA_ROOT")
+    if env_root:
+        return Path(env_root).expanduser().resolve()
+
+    docker_root = Path("/app/data")
+    if docker_root.exists() or Path("/.dockerenv").exists():
+        return docker_root
+
+    return Path(__file__).resolve().parents[1] / "data"
+
+
+DATA_ROOT = _resolve_data_root()
+BRONZE_PATH = str(DATA_ROOT / "bronze")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

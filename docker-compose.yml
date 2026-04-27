@@ -1,5 +1,3 @@
-version: '3.8'
-
 # ============================================================
 #  Social Media Analytics Dashboard
 #  Services: spark (FastAPI + PySpark) + frontend (React + nginx)
@@ -22,6 +20,7 @@ services:
       - ./data_pipeline:/app/data_pipeline
       - ./backend_api:/app/backend_api
       - ./.env:/app/.env:ro
+      - ${YOUTUBE_STATIC_HOST_PATH:-./data/youtube_static}:/mnt/youtube_static:ro  # Static YT dataset (override via YOUTUBE_STATIC_HOST_PATH)
     ports:
       - "5000:5000"               # FastAPI REST API (direct access for dev)
     networks:

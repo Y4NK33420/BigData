@@ -21,7 +21,21 @@ import re
 import math
 import pandas as pd
 
-STATIC_BASE = "/mnt/youtube_static"
+def _resolve_static_base() -> str:
+    """Resolve static YouTube dataset root for Docker and local dev."""
+    candidates = [
+        os.environ.get("YOUTUBE_STATIC_PATH", "").strip(),
+        "/mnt/youtube_static",
+        "/mnt/c/Users/asus/Downloads/youtube_data",
+    ]
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
+    # Keep default Docker path for stable log messages.
+    return "/mnt/youtube_static"
+
+
+STATIC_BASE = _resolve_static_base()
 CHANNELS_FILE   = os.path.join(STATIC_BASE, "df_channels_en.tsv")
 TIMESERIES_FILE = os.path.join(STATIC_BASE, "df_timeseries_en.tsv")
 

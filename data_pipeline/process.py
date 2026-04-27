@@ -24,9 +24,23 @@ from pathlib import Path
 keyword  = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else "technology"
 kw_safe  = keyword.replace(" ", "_").lower()
 
-BRONZE_PATH = "/app/data/bronze"
-SILVER_PATH = "/app/data/silver"
-GOLD_PATH   = "/app/data/gold"
+def _resolve_data_root() -> Path:
+    """Resolve Medallion data root for both Docker and local development."""
+    env_root = os.environ.get("MEDALLION_DATA_ROOT")
+    if env_root:
+        return Path(env_root).expanduser().resolve()
+
+    docker_root = Path("/app/data")
+    if docker_root.exists() or Path("/.dockerenv").exists():
+        return docker_root
+
+    return Path(__file__).resolve().parents[1] / "data"
+
+
+DATA_ROOT = _resolve_data_root()
+BRONZE_PATH = str(DATA_ROOT / "bronze")
+SILVER_PATH = str(DATA_ROOT / "silver")
+GOLD_PATH   = str(DATA_ROOT / "gold")
 
 os.makedirs(SILVER_PATH, exist_ok=True)
 os.makedirs(GOLD_PATH,   exist_ok=True)

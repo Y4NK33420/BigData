@@ -1,4 +1,6 @@
 import { useState, useCallback } from 'react'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import SentimentChart from './charts/SentimentChart.jsx'
 import TimelineChart from './charts/TimelineChart.jsx'
 import TopVideosTable from './charts/TopVideosTable.jsx'
@@ -310,12 +312,13 @@ export default function Dashboard({ data }) {
                   borderRadius: 18,
                   padding: '20px 24px',
                   border: '1px solid rgba(168,135,206,0.18)',
-                  whiteSpace: 'pre-wrap',
                   color: 'var(--text)',
                   fontSize: 14,
                   lineHeight: 1.8,
-                }}>
-                  {aiCards}
+                }} className="markdown-text ai-markdown">
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                    {aiCards}
+                  </ReactMarkdown>
                 </div>
                 <button
                   onClick={fetchAiCards}

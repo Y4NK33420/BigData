@@ -3,6 +3,7 @@ import axios from 'axios'
 import Sidebar from './components/Sidebar.jsx'
 import Dashboard from './components/Dashboard.jsx'
 import Welcome from './components/Welcome.jsx'
+import ChatSidebar from './components/ChatSidebar.jsx'
 
 const API = import.meta.env.VITE_API_URL || ''
 const POLL_INTERVAL_MS = 2000  // poll every 2 seconds while job is running
@@ -103,7 +104,7 @@ export default function App() {
   }, [])
 
   return (
-    <div className="layout">
+    <div className={`layout ${data ? 'layout-with-chat' : ''}`}>
       <Sidebar
         keyword={keyword}
         setKeyword={setKeyword}
@@ -121,6 +122,9 @@ export default function App() {
           : <Welcome />
         }
       </main>
+      {data && (
+        <ChatSidebar keyword={activeKw || data.keyword || keyword} data={data} />
+      )}
     </div>
   )
 }

@@ -23,7 +23,7 @@ import threading
 import subprocess
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Any
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
@@ -53,6 +53,31 @@ def get_gemini_api_key() -> str:
     load_env_from_dotenv()
     return os.environ.get("GEMINI_API_KEY", "").strip()
 
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover
+    def load_dotenv(*args, **kwargs):
+        return False
+
+try:
+    from chat_agent import GeminiToolAgent
+    from chat_models import (
+        ChatRequest,
+        ChatResponse,
+        ChatMessage,
+        StartSessionRequest,
+        StartSessionResponse,
+    )
+except ImportError:  # pragma: no cover
+    from .chat_agent import GeminiToolAgent
+    from .chat_models import (
+        ChatRequest,
+        ChatResponse,
+        ChatMessage,
+        StartSessionRequest,
+        StartSessionResponse,
+    )
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Setup
 # ─────────────────────────────────────────────────────────────────────────────
@@ -63,9 +88,30 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-GOLD_PATH   = "/app/data/gold"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(PROJECT_ROOT / ".env")
+load_env_from_dotenv(PROJECT_ROOT / ".env")
+
+def _resolve_data_root() -> Path:
+    """Resolve Medallion data root for both Docker and local development."""
+    env_root = os.environ.get("MEDALLION_DATA_ROOT")
+    if env_root:
+        return Path(env_root).expanduser().resolve()
+
+    docker_root = Path("/app/data")
+    if docker_root.exists() or Path("/.dockerenv").exists():
+        return docker_root
+
+    return Path(__file__).resolve().parents[1] / "data"
+
+
+DATA_ROOT = _resolve_data_root()
+GOLD_PATH = str(DATA_ROOT / "gold")
 SCRIPTS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data_pipeline")
 PYTHON      = sys.executable
+GEMINI_KEY  = os.environ.get("GEMINI_API_KEY", "")
+VERTEX_KEY  = os.environ.get("VERTEX_API_KEY", "")
+CHAT_MODEL  = os.environ.get("CHAT_GEMINI_MODEL", "gemini-3.1-flash-lite-preview")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # In-Memory Job Store (thread-safe)
@@ -77,6 +123,11 @@ _JOBS_LOCK = threading.Lock()
 # Gold data cache: {kw_safe: {"data": {...}, "ts": float}}
 _DATA_CACHE: dict[str, dict] = {}
 CACHE_TTL_SECONDS = 3600  # 1 hour
+
+# In-memory chat session store: {conversation_id: [ChatMessage dict, ...]}
+_CHAT_CONVERSATIONS: dict[str, list[dict[str, Any]]] = {}
+_CHAT_LOCK = threading.Lock()
+_CHAT_AGENT: GeminiToolAgent | None = None
 
 def _job_create(keyword: str) -> str:
     job_id = str(uuid.uuid4())[:8]
@@ -209,6 +260,64 @@ class PipelineRequest(BaseModel):
     keyword: str
 
 
+def _get_chat_agent() -> GeminiToolAgent:
+    global _CHAT_AGENT
+    if _CHAT_AGENT is None:
+        chat_key = VERTEX_KEY or GEMINI_KEY
+        if not chat_key:
+            raise HTTPException(status_code=503, detail="VERTEX_API_KEY or GEMINI_API_KEY not configured.")
+        use_vertex = bool(VERTEX_KEY)
+        log.info("[chat] Creating Gemini tool agent backend=%s model=%s", "vertex" if use_vertex else "gemini-api", CHAT_MODEL)
+        _CHAT_AGENT = GeminiToolAgent(
+            model_name=CHAT_MODEL,
+            api_key=chat_key,
+            use_vertex=use_vertex,
+        )
+    return _CHAT_AGENT
+
+
+def _dump_model(model_obj: BaseModel) -> dict:
+    if hasattr(model_obj, "model_dump"):
+        return model_obj.model_dump()
+    return model_obj.dict()
+
+
+def _generate_vertex_gemini_text(prompt: str, *, temperature: float = 0.7, max_output_tokens: int = 8192) -> str:
+    """Generate text using the Vertex Gemini key path shared by chat."""
+    if not VERTEX_KEY:
+        raise HTTPException(status_code=503, detail="VERTEX_API_KEY not configured.")
+
+    try:
+        from google import genai
+        from google.genai import types
+
+        client = genai.Client(vertexai=True, api_key=VERTEX_KEY)
+        config = types.GenerateContentConfig(
+            temperature=temperature,
+            top_p=0.95,
+            max_output_tokens=max_output_tokens,
+            http_options=types.HttpOptions(timeout=30000),
+            safety_settings=[
+                types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="OFF"),
+                types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="OFF"),
+                types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="OFF"),
+                types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="OFF"),
+            ],
+            thinking_config=types.ThinkingConfig(thinking_level="LOW"),
+        )
+        response = client.models.generate_content(
+            model=CHAT_MODEL,
+            contents=prompt,
+            config=config,
+        )
+        return getattr(response, "text", None) or ""
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log.exception("Vertex Gemini call failed")
+        raise HTTPException(status_code=500, detail=f"Vertex Gemini error: {exc}") from exc
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Routes
 # ─────────────────────────────────────────────────────────────────────────────
@@ -269,6 +378,114 @@ def pipeline_history():
     with _JOBS_LOCK:
         jobs = sorted(_JOBS.values(), key=lambda j: j["started_at"], reverse=True)
     return {"jobs": jobs}
+
+
+@app.post("/api/chat/session/start", response_model=StartSessionResponse)
+def start_chat_session(body: StartSessionRequest):
+    keyword = body.keyword.strip()
+    if not keyword:
+        raise HTTPException(status_code=400, detail="keyword is required")
+
+    conv_id = str(uuid.uuid4())[:8]
+    log.info("[chat:%s] Session started for keyword='%s'", conv_id, keyword)
+    with _CHAT_LOCK:
+        _CHAT_CONVERSATIONS[conv_id] = [
+            _dump_model(ChatMessage(role="system", content=f"Chat started for keyword '{keyword}'", meta={"keyword": keyword}))
+        ]
+
+    return StartSessionResponse(conversation_id=conv_id, keyword=keyword)
+
+
+@app.get("/api/chat/history/{conversation_id}")
+def get_chat_history(conversation_id: str):
+    with _CHAT_LOCK:
+        history = _CHAT_CONVERSATIONS.get(conversation_id)
+    if history is None:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    return {"conversation_id": conversation_id, "messages": history}
+
+
+@app.post("/api/chat/message", response_model=ChatResponse)
+def chat_message(body: ChatRequest):
+    keyword = body.keyword.strip()
+    message = body.message.strip()
+
+    if not keyword:
+        raise HTTPException(status_code=400, detail="keyword is required")
+    if not message:
+        raise HTTPException(status_code=400, detail="message is required")
+
+    conv_id = body.conversation_id or str(uuid.uuid4())[:8]
+    request_id = str(uuid.uuid4())[:8]
+    log.info(
+        "[chat:%s:%s] Message received keyword='%s' chars=%d dashboard_data=%s",
+        conv_id,
+        request_id,
+        keyword,
+        len(message),
+        isinstance(body.dashboard_data, dict),
+    )
+
+    with _CHAT_LOCK:
+        history = _CHAT_CONVERSATIONS.setdefault(conv_id, [])
+
+    if isinstance(body.dashboard_data, dict) and body.dashboard_data:
+        gold_data = body.dashboard_data
+        log.info("[chat:%s:%s] Using dashboard payload from frontend", conv_id, request_id)
+    else:
+        log.info("[chat:%s:%s] Loading gold data from backend cache/files", conv_id, request_id)
+        gold_data = get_data(keyword=keyword)
+
+    try:
+        agent = _get_chat_agent()
+        answer, tool_events, charts = agent.run(
+            keyword=keyword,
+            user_message=message,
+            history=history,
+            gold_data=gold_data,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log.exception("[chat:%s:%s] Agent failed", conv_id, request_id)
+        raise HTTPException(status_code=500, detail=f"Chat agent failed: {exc}") from exc
+
+    user_msg = _dump_model(ChatMessage(role="user", content=message, meta={"keyword": keyword}))
+    assistant_msg = _dump_model(
+        ChatMessage(
+            role="assistant",
+            content=answer,
+            meta={
+                "tool_events": [
+                    _dump_model(ev) if isinstance(ev, BaseModel) else ev
+                    for ev in tool_events
+                ],
+                "charts": [
+                    _dump_model(c) if isinstance(c, BaseModel) else c
+                    for c in charts
+                ],
+            },
+        )
+    )
+
+    with _CHAT_LOCK:
+        _CHAT_CONVERSATIONS.setdefault(conv_id, []).append(user_msg)
+        _CHAT_CONVERSATIONS.setdefault(conv_id, []).append(assistant_msg)
+
+    log.info(
+        "[chat:%s:%s] Response ready answer_len=%d tools=%d charts=%d",
+        conv_id,
+        request_id,
+        len(answer),
+        len(tool_events),
+        len(charts),
+    )
+    return ChatResponse(
+        conversation_id=conv_id,
+        answer=answer,
+        charts=charts,
+        tool_events=tool_events,
+    )
 
 
 @app.get("/api/data")
@@ -483,9 +700,8 @@ def prescribe(keyword: str = Query(..., description="Analysis keyword")):
     Generate video ideas with Gemini, then score those ideas with the
     keyword-specific Random Forest model saved by the pipeline.
     """
-    gemini_key = get_gemini_api_key()
-    if not gemini_key:
-        raise HTTPException(status_code=503, detail="GEMINI_API_KEY not configured.")
+    if not VERTEX_KEY:
+        raise HTTPException(status_code=503, detail="VERTEX_API_KEY not configured.")
 
     kw = kw_safe(keyword)
     g  = GOLD_PATH
@@ -540,49 +756,37 @@ Each item must have these exact keys:
 
 Make the ideas concrete and title-like. Reference content gaps and subreddit demand when useful."""
 
-    try:
-        import urllib.request, json as _json
-        url     = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite-preview:generateContent?key={gemini_key}"
-        payload = {"contents": [{"parts": [{"text": prompt}]}]}
-        req     = urllib.request.Request(
-            url, data=_json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"}, method="POST"
+    ai_text = _generate_vertex_gemini_text(prompt, temperature=0.5, max_output_tokens=8192)
+    ideas = _extract_json_array(ai_text)
+    if not ideas:
+        ideas = _fallback_ideas(keyword, content_gaps, top_videos)
+    predicted_ideas = _predict_video_ideas(keyword, ideas, top_videos)
+
+    recommendation_text = "\n\n".join(
+        (
+            f"{i}. {idea.get('title', 'Untitled idea')}\n"
+            f"Format: {idea.get('format', '')}\n"
+            f"Predicted views: {int(idea.get('predicted_views', 0)):,}"
+            if idea.get("predicted_views") is not None else
+            f"{i}. {idea.get('title', 'Untitled idea')}\nFormat: {idea.get('format', '')}"
         )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            result  = _json.loads(resp.read())
-            ai_text = result["candidates"][0]["content"]["parts"][0]["text"]
+        for i, idea in enumerate(predicted_ideas, start=1)
+    )
 
-        ideas = _extract_json_array(ai_text)
-        if not ideas:
-            ideas = _fallback_ideas(keyword, content_gaps, top_videos)
-        predicted_ideas = _predict_video_ideas(keyword, ideas, top_videos)
-
-        recommendation_text = "\n\n".join(
-            (
-                f"{i}. {idea.get('title', 'Untitled idea')}\n"
-                f"Format: {idea.get('format', '')}\n"
-                f"Predicted views: {int(idea.get('predicted_views', 0)):,}"
-                if idea.get("predicted_views") is not None else
-                f"{i}. {idea.get('title', 'Untitled idea')}\nFormat: {idea.get('format', '')}"
-            )
-            for i, idea in enumerate(predicted_ideas, start=1)
-        )
-
-        return {
-            "keyword":         keyword,
-            "viability_score": viability,
-            "recommendations": recommendation_text,
-            "video_ideas":     predicted_ideas,
-            "prompt_context":  {
-                "avg_like_view_ratio": avg_lv_ratio,
-                "top_subreddits":      top3_subs,
-                "assessment":          rec_summary,
-                "model_r2":            r2_score,
-            }
+    return {
+        "keyword":         keyword,
+        "viability_score": viability,
+        "recommendations": recommendation_text,
+        "video_ideas":     predicted_ideas,
+        "provider":        "vertex",
+        "model":           CHAT_MODEL,
+        "prompt_context":  {
+            "avg_like_view_ratio": avg_lv_ratio,
+            "top_subreddits":      top3_subs,
+            "assessment":          rec_summary,
+            "model_r2":            r2_score,
         }
-    except Exception as e:
-        log.error(f"Gemini API call failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Gemini API error: {str(e)}")
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
