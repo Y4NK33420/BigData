@@ -3,7 +3,7 @@ import { ComposedChart, Bar, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend,
 const Tip = ({ active, payload, label }) => {
   if (!active || !payload?.length) return null
   return (
-    <div style={{ background: '#16162a', border: '1px solid rgba(255,255,255,0.07)', borderRadius: 8, padding: '8px 14px', fontSize: '0.82rem' }}>
+    <div style={{ background: '#1a1a1a', border: '1px solid #383838', borderRadius: 8, padding: '8px 14px', fontSize: '0.82rem' }}>
       <div style={{ color: 'rgba(255,255,255,0.5)', marginBottom: 4 }}>{label}</div>
       {payload.map(p => <div key={p.name} style={{ color: p.color }}>{p.name}: <strong>{Number(p.value).toLocaleString()}</strong></div>)}
     </div>
@@ -29,12 +29,12 @@ export default function YTvsReddit({ ytData, rdData }) {
       <ComposedChart data={merged} margin={{ top: 4, right: 12, bottom: 0, left: 0 }}>
         <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
         <XAxis dataKey="date" tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 10 }} axisLine={false} tickLine={false} />
-        <YAxis yAxisId="left"  tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 10 }} axisLine={false} tickLine={false} width={30} />
+        <YAxis yAxisId="left" tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 10 }} axisLine={false} tickLine={false} width={30} />
         <YAxis yAxisId="right" orientation="right" tick={{ fill: '#f97316', fontSize: 10 }} axisLine={false} tickLine={false} width={30} />
         <Tooltip content={<Tip />} />
         <Legend iconSize={10} wrapperStyle={{ fontSize: '0.78rem' }} />
-        <Bar yAxisId="left" dataKey="YT Uploads" fill="rgba(99,102,241,0.7)" radius={[4,4,0,0]} />
-        <Line yAxisId="right" type="monotone" dataKey="Reddit Posts" stroke="#f97316" strokeWidth={2.5} dot={false} />
+        <Bar yAxisId="left" dataKey="YT Uploads" fill="rgba(255,0,0,0.7)" radius={[4, 4, 0, 0]} />
+        <Line yAxisId="right" type="monotone" dataKey="Reddit Posts" stroke="#FF4500" strokeWidth={2.5} dot={false} />
       </ComposedChart>
     </ResponsiveContainer>
   )
